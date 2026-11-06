@@ -15,17 +15,23 @@ if (!fs.existsSync(MEDIA_DIR)) {
 // Initialize SQLite database connection
 const db = new Database('mlcoe_archive.db');
 
-// Ensure database schema exists
+// Ensure base schema exists
 db.exec(`
   CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
     sender TEXT,
     push_name TEXT,
     content TEXT,
-    media_path TEXT,
     timestamp INTEGER
   )
 `);
+
+// Auto-migration for existing tables missing media_path
+try {
+  db.exec(`ALTER TABLE messages ADD COLUMN media_path TEXT;`);
+} catch (err) {
+  // Column already exists, safe to ignore
+}
 
 // Prepare insert statement
 const insertMessage = db.prepare(`
@@ -35,13 +41,71 @@ const insertMessage = db.prepare(`
 
 const TARGET_GROUP_JID = process.env.TARGET_GROUP_JID;
 
+/**
+ * Recursively unwraps ephemeral, view-once, edited, and container payloads.
+ */
 function unwrapMessage(msgPayload) {
   if (!msgPayload) return null;
   if (msgPayload.ephemeralMessage?.message) return unwrapMessage(msgPayload.ephemeralMessage.message);
   if (msgPayload.viewOnceMessage?.message) return unwrapMessage(msgPayload.viewOnceMessage.message);
   if (msgPayload.viewOnceMessageV2?.message) return unwrapMessage(msgPayload.viewOnceMessageV2.message);
   if (msgPayload.documentWithCaptionMessage?.message) return unwrapMessage(msgPayload.documentWithCaptionMessage.message);
+  if (msgPayload.editedMessage?.message?.protocolMessage?.editedMessage) {
+    return unwrapMessage(msgPayload.editedMessage.message.protocolMessage.editedMessage);
+  }
   return msgPayload;
+}
+
+/**
+ * Safely extracts exact text string from any message payload.
+ */
+function extractContent(unwrappedPayload) {
+  if (!unwrappedPayload) return '';
+
+  // 1. Direct Text Message
+  if (unwrappedPayload.conversation) {
+    return unwrappedPayload.conversation;
+  }
+
+  // 2. Extended Text Message (Mentions, Emojis, Links, Replies)
+  if (unwrappedPayload.extendedTextMessage) {
+    return (
+      unwrappedPayload.extendedTextMessage.text ||
+      unwrappedPayload.extendedTextMessage.matchedText ||
+      ''
+    );
+  }
+
+  // 3. Media Captions & Documents
+  if (unwrappedPayload.imageMessage) {
+    const caption = unwrappedPayload.imageMessage.caption || '';
+    return caption ? `[Image] ${caption}` : '[Image]';
+  }
+
+  if (unwrappedPayload.videoMessage) {
+    const caption = unwrappedPayload.videoMessage.caption || '';
+    return caption ? `[Video] ${caption}` : '[Video]';
+  }
+
+  if (unwrappedPayload.documentMessage) {
+    const fileName = unwrappedPayload.documentMessage.fileName || '';
+    const caption = unwrappedPayload.documentMessage.caption || '';
+    return `[Document: ${fileName}] ${caption}`.trim();
+  }
+
+  if (unwrappedPayload.audioMessage) {
+    return unwrappedPayload.audioMessage.ptt ? '[Voice Note]' : '[Audio File]';
+  }
+
+  if (unwrappedPayload.stickerMessage) {
+    return '[Sticker]';
+  }
+
+  if (unwrappedPayload.reactionMessage) {
+    return `[Reaction] ${unwrappedPayload.reactionMessage.text || ''}`.trim();
+  }
+
+  return '';
 }
 
 /**
@@ -51,7 +115,6 @@ async function handleMediaDownload(msg, msgType, rawDocumentName) {
   try {
     const buffer = await downloadMediaMessage(msg, 'buffer', {});
     
-    // Dynamic Extension Detection
     let ext = '.bin';
     if (msgType === 'imageMessage') ext = '.jpg';
     else if (msgType === 'videoMessage') ext = '.mp4';
@@ -116,27 +179,21 @@ async function startBot() {
       if (!unwrappedPayload) return;
 
       const msgType = Object.keys(unwrappedPayload)[0];
-      let content = '[Text Message]';
+      const content = extractContent(unwrappedPayload);
       let mediaPath = null;
 
-      if (msgType === 'conversation') {
-        content = unwrappedPayload.conversation;
-      } else if (msgType === 'extendedTextMessage') {
-        content = unwrappedPayload.extendedTextMessage?.text || '';
-      } else if (['imageMessage', 'videoMessage', 'documentMessage', 'stickerMessage', 'audioMessage'].includes(msgType)) {
-        const mediaObj = unwrappedPayload[msgType];
-        const caption = mediaObj?.caption || '';
-        const docName = mediaObj?.fileName || '';
-        
-        content = `[${msgType}] ${docName} ${caption}`.trim();
-
-        // Downloads PDF, Docs, Videos, Images, Audio directly to ./downloads/
-        mediaPath = await handleMediaDownload(msg, msgType, docName);
+      // Handle file download if message type contains media
+      if (['imageMessage', 'videoMessage', 'documentMessage', 'stickerMessage', 'audioMessage'].includes(msgType)) {
+        const rawDocName = unwrappedPayload[msgType]?.fileName || '';
+        mediaPath = await handleMediaDownload(msg, msgType, rawDocName);
       }
+
+      // Ignore empty system protocol updates
+      if (!content && !mediaPath) return;
 
       try {
         insertMessage.run(msgId, sender, pushName, content, mediaPath, timestamp);
-        console.log(`Saved message [${msgId}] from ${pushName} | Storage: ${mediaPath ? mediaPath : 'Text Only'}`);
+        console.log(`Saved message [${msgId}] from ${pushName}: "${content.substring(0, 30)}..." | Storage: ${mediaPath ? mediaPath : 'Text Only'}`);
       } catch (err) {
         console.error('Failed to write message to database:', err.message);
       }
