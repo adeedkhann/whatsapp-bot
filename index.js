@@ -1,204 +1,299 @@
 import 'dotenv/config';
-import makeWASocket, { useMultiFileAuthState, DisconnectReason, downloadMediaMessage } from '@whiskeysockets/baileys';
-import Database from 'better-sqlite3';
+import makeWASocket, {
+  DisconnectReason,
+  downloadMediaMessage,
+  useMultiFileAuthState,
+} from '@whiskeysockets/baileys';
+import { v2 as cloudinary } from 'cloudinary';
+import { PrismaClient } from '@prisma/client';
 import qrcode from 'qrcode-terminal';
 import pino from 'pino';
-import fs from 'fs';
-import path from 'path';
 
-// Ensure media download directory exists
-const MEDIA_DIR = './downloads';
-if (!fs.existsSync(MEDIA_DIR)) {
-  fs.mkdirSync(MEDIA_DIR, { recursive: true });
+const requiredEnvironment = [
+  'DATABASE_URL',
+  'CLOUDINARY_CLOUD_NAME',
+  'CLOUDINARY_API_KEY',
+  'CLOUDINARY_API_SECRET',
+];
+
+for (const variable of requiredEnvironment) {
+  if (!process.env[variable]) {
+    throw new Error(`Missing required environment variable: ${variable}`);
+  }
 }
 
-// Initialize SQLite database connection
-const db = new Database('mlcoe_archive.db');
+const prisma = new PrismaClient();
+const TARGET_GROUP_JID = process.env.TARGET_GROUP_JID?.trim();
 
-// Ensure base schema exists
-db.exec(`
-  CREATE TABLE IF NOT EXISTS messages (
-    id TEXT PRIMARY KEY,
-    sender TEXT,
-    push_name TEXT,
-    content TEXT,
-    timestamp INTEGER
-  )
-`);
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+  secure: true,
+});
 
-// Auto-migration for existing tables missing media_path
-try {
-  db.exec(`ALTER TABLE messages ADD COLUMN media_path TEXT;`);
-} catch (err) {
-  // Column already exists, safe to ignore
-}
-
-// Prepare insert statement
-const insertMessage = db.prepare(`
-  INSERT OR IGNORE INTO messages (id, sender, push_name, content, media_path, timestamp)
-  VALUES (?, ?, ?, ?, ?, ?)
-`);
-
-const TARGET_GROUP_JID = process.env.TARGET_GROUP_JID;
-
-/**
- * Recursively unwraps ephemeral, view-once, edited, and container payloads.
- */
 function unwrapMessage(msgPayload) {
   if (!msgPayload) return null;
-  if (msgPayload.ephemeralMessage?.message) return unwrapMessage(msgPayload.ephemeralMessage.message);
-  if (msgPayload.viewOnceMessage?.message) return unwrapMessage(msgPayload.viewOnceMessage.message);
-  if (msgPayload.viewOnceMessageV2?.message) return unwrapMessage(msgPayload.viewOnceMessageV2.message);
-  if (msgPayload.documentWithCaptionMessage?.message) return unwrapMessage(msgPayload.documentWithCaptionMessage.message);
+  if (msgPayload.ephemeralMessage?.message) {
+    return unwrapMessage(msgPayload.ephemeralMessage.message);
+  }
+  if (msgPayload.viewOnceMessage?.message) {
+    return unwrapMessage(msgPayload.viewOnceMessage.message);
+  }
+  if (msgPayload.viewOnceMessageV2?.message) {
+    return unwrapMessage(msgPayload.viewOnceMessageV2.message);
+  }
+  if (msgPayload.documentWithCaptionMessage?.message) {
+    return unwrapMessage(msgPayload.documentWithCaptionMessage.message);
+  }
   if (msgPayload.editedMessage?.message?.protocolMessage?.editedMessage) {
     return unwrapMessage(msgPayload.editedMessage.message.protocolMessage.editedMessage);
   }
   return msgPayload;
 }
 
-/**
- * Safely extracts exact text string from any message payload.
- */
-function extractContent(unwrappedPayload) {
-  if (!unwrappedPayload) return '';
-
-  // 1. Direct Text Message
-  if (unwrappedPayload.conversation) {
-    return unwrappedPayload.conversation;
+function extractContent(payload) {
+  if (!payload) return '';
+  if (payload.conversation) return payload.conversation;
+  if (payload.extendedTextMessage) {
+    return payload.extendedTextMessage.text || payload.extendedTextMessage.matchedText || '';
   }
-
-  // 2. Extended Text Message (Mentions, Emojis, Links, Replies)
-  if (unwrappedPayload.extendedTextMessage) {
-    return (
-      unwrappedPayload.extendedTextMessage.text ||
-      unwrappedPayload.extendedTextMessage.matchedText ||
-      ''
-    );
+  if (payload.imageMessage) {
+    return payload.imageMessage.caption ? `[Image] ${payload.imageMessage.caption}` : '[Image]';
   }
-
-  // 3. Media Captions & Documents
-  if (unwrappedPayload.imageMessage) {
-    const caption = unwrappedPayload.imageMessage.caption || '';
-    return caption ? `[Image] ${caption}` : '[Image]';
+  if (payload.videoMessage) {
+    return payload.videoMessage.caption ? `[Video] ${payload.videoMessage.caption}` : '[Video]';
   }
-
-  if (unwrappedPayload.videoMessage) {
-    const caption = unwrappedPayload.videoMessage.caption || '';
-    return caption ? `[Video] ${caption}` : '[Video]';
+  if (payload.documentMessage) {
+    const name = payload.documentMessage.fileName || '';
+    const caption = payload.documentMessage.caption || '';
+    return `[Document: ${name}] ${caption}`.trim();
   }
-
-  if (unwrappedPayload.documentMessage) {
-    const fileName = unwrappedPayload.documentMessage.fileName || '';
-    const caption = unwrappedPayload.documentMessage.caption || '';
-    return `[Document: ${fileName}] ${caption}`.trim();
+  if (payload.audioMessage) return payload.audioMessage.ptt ? '[Voice Note]' : '[Audio File]';
+  if (payload.stickerMessage) return '[Sticker]';
+  if (payload.reactionMessage) {
+    return `[Reaction] ${payload.reactionMessage.text || ''}`.trim();
   }
-
-  if (unwrappedPayload.audioMessage) {
-    return unwrappedPayload.audioMessage.ptt ? '[Voice Note]' : '[Audio File]';
-  }
-
-  if (unwrappedPayload.stickerMessage) {
-    return '[Sticker]';
-  }
-
-  if (unwrappedPayload.reactionMessage) {
-    return `[Reaction] ${unwrappedPayload.reactionMessage.text || ''}`.trim();
-  }
-
   return '';
 }
 
-/**
- * Downloads media payload (Image, Video, PDF/Doc, Audio) to disk and returns local file path.
- */
-async function handleMediaDownload(msg, msgType, rawDocumentName) {
-  try {
-    const buffer = await downloadMediaMessage(msg, 'buffer', {});
-    
-    let ext = '.bin';
-    if (msgType === 'imageMessage') ext = '.jpg';
-    else if (msgType === 'videoMessage') ext = '.mp4';
-    else if (msgType === 'audioMessage') ext = '.ogg';
-    else if (msgType === 'stickerMessage') ext = '.webp';
-    else if (msgType === 'documentMessage') {
-      ext = rawDocumentName ? path.extname(rawDocumentName) || '.pdf' : '.pdf';
+function messageTypeFor(payload) {
+  const type = Object.keys(payload)[0];
+  const types = {
+    conversation: 'TEXT',
+    extendedTextMessage: 'TEXT',
+    imageMessage: 'IMAGE',
+    videoMessage: 'VIDEO',
+    documentMessage: 'DOCUMENT',
+    audioMessage: 'AUDIO',
+    stickerMessage: 'STICKER',
+    reactionMessage: 'REACTION',
+  };
+  return types[type] || 'TEXT';
+}
+
+function toJsonValue(value) {
+  if (value === undefined) return null;
+  if (typeof value === 'bigint') return value.toString();
+  if (value instanceof Uint8Array) return Buffer.from(value).toString('base64');
+  if (Array.isArray(value)) return value.map(toJsonValue);
+  if (value && typeof value === 'object') {
+    const output = {};
+    for (const [key, nestedValue] of Object.entries(value)) {
+      output[key] = toJsonValue(nestedValue);
+    }
+    return output;
+  }
+  return value;
+}
+
+function timestampToDate(timestamp) {
+  const seconds = typeof timestamp === 'object' && timestamp !== null
+    ? Number(timestamp.toString())
+    : Number(timestamp);
+  if (!Number.isFinite(seconds)) throw new Error(`Invalid WhatsApp message timestamp: ${timestamp}`);
+  return new Date(seconds * 1000);
+}
+
+const GROUP_SYNC_DELAY_MS = 3000;
+const GROUP_FETCH_ATTEMPTS = 3;
+
+const wait = (milliseconds) => new Promise((resolve) => {
+  setTimeout(resolve, milliseconds);
+});
+
+async function fetchParticipatingGroups(sock) {
+  let groups = {};
+
+  for (let attempt = 1; attempt <= GROUP_FETCH_ATTEMPTS; attempt += 1) {
+    await wait(GROUP_SYNC_DELAY_MS);
+    groups = await sock.groupFetchAllParticipating();
+
+    if (Object.keys(groups).length > 0 || attempt === GROUP_FETCH_ATTEMPTS) {
+      return groups;
     }
 
-    const fileName = `${msg.key.id}${ext}`;
-    const filePath = path.join(MEDIA_DIR, fileName);
-
-    fs.writeFileSync(filePath, buffer);
-    return filePath;
-  } catch (err) {
-    console.error('Failed to download media file:', err.message);
-    return null;
+    console.log(`Group list is still synchronizing; retrying (${attempt + 1}/${GROUP_FETCH_ATTEMPTS})...`);
   }
+
+  return groups;
+}
+
+function displayGroups(groups) {
+  const participatingGroups = Object.values(groups);
+
+  console.log('\n==========================================');
+  console.log(`📋 TOTAL PARTICIPATING GROUPS: ${participatingGroups.length}`);
+  console.log('==========================================');
+
+  if (participatingGroups.length === 0) {
+    console.log('No participating WhatsApp groups were found for this account.');
+    return;
+  }
+
+  participatingGroups.forEach((group, index) => {
+    console.log(`${index + 1}. Group Name: "${group.subject || 'Unnamed group'}"`);
+    console.log(`   JID: ${group.id}`);
+    console.log('------------------------------------------');
+  });
+}
+
+function uploadBuffer(buffer, options) {
+  return new Promise((resolve, reject) => {
+    const upload = cloudinary.uploader.upload_stream(
+      { folder: 'mlcoe-whatsapp', resource_type: 'auto', ...options },
+      (error, result) => {
+        if (error) reject(error);
+        else if (!result?.secure_url || !result.public_id) {
+          reject(new Error('Cloudinary returned an incomplete upload result'));
+        } else resolve(result);
+      },
+    );
+    upload.end(buffer);
+  });
+}
+
+async function uploadMedia(msg, payload, messageType) {
+  const media = payload[Object.keys(payload)[0]];
+  const buffer = await downloadMediaMessage(msg, 'buffer', {});
+  const result = await uploadBuffer(buffer, {
+    public_id: msg.key.id,
+    format: media?.fileName?.split('.').pop(),
+  });
+  return {
+    cloudinaryUrl: result.secure_url,
+    publicId: result.public_id,
+    fileType: media?.mimetype || `application/octet-stream`,
+    fileName: media?.fileName || null,
+    fileSize: buffer.length,
+    messageType,
+  };
+}
+
+async function archiveMessage(msg) {
+  if (!msg?.message || msg.key.remoteJid !== TARGET_GROUP_JID) return;
+
+  const payload = unwrapMessage(msg.message);
+  if (!payload) return;
+
+  const messageType = messageTypeFor(payload);
+  const content = extractContent(payload);
+  const mediaTypes = ['IMAGE', 'VIDEO', 'DOCUMENT', 'AUDIO', 'STICKER'];
+  const media = mediaTypes.includes(messageType)
+    ? await uploadMedia(msg, payload, messageType)
+    : null;
+
+  if (!content && !media) return;
+
+  const senderId = msg.key.participant || msg.key.remoteJid;
+  const timestamp = timestampToDate(msg.messageTimestamp);
+  const rawPayload = toJsonValue(msg.message);
+
+  await prisma.$transaction([
+    prisma.user.upsert({
+      where: { id: senderId },
+      create: { id: senderId, pushName: msg.pushName || 'Unknown' },
+      update: { pushName: msg.pushName || 'Unknown' },
+    }),
+    prisma.message.create({
+      data: {
+        id: msg.key.id,
+        senderId,
+        groupJid: TARGET_GROUP_JID,
+        content,
+        messageType,
+        rawPayload,
+        timestamp,
+        media: media ? {
+          create: {
+            cloudinaryUrl: media.cloudinaryUrl,
+            publicId: media.publicId,
+            fileType: media.fileType,
+            fileName: media.fileName,
+            fileSize: media.fileSize,
+          },
+        } : undefined,
+        llmContextMetadata: {
+          create: { isContextEligible: messageType !== 'REACTION' },
+        },
+      },
+    }),
+  ]);
+
+  console.log(`Archived ${msg.key.id} from ${msg.pushName || 'Unknown'} as ${messageType}`);
 }
 
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info');
-
-  const sock = makeWASocket({
-    auth: state,
-    logger: pino({ level: 'silent' }),
-  });
+  const sock = makeWASocket({ auth: state, logger: pino({ level: 'silent' }) });
+  let groupDiscoveryStarted = false;
 
   sock.ev.on('creds.update', saveCreds);
-
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
+  sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
     if (qr) {
       console.log('\nScan the QR Code to authenticate WhatsApp session:\n');
       qrcode.generate(qr, { small: true });
     }
-
     if (connection === 'open') {
-      console.log('WhatsApp connection successfully established.');
-      console.log(`Messaging listener active for target group: ${TARGET_GROUP_JID}`);
-    }
+      if (!TARGET_GROUP_JID) {
+        if (groupDiscoveryStarted) return;
+        groupDiscoveryStarted = true;
 
+        try {
+          const groups = await fetchParticipatingGroups(sock);
+          displayGroups(groups);
+          console.log('\nSet TARGET_GROUP_JID=<group JID> in .env and restart the archive service.');
+        } catch (error) {
+          console.error('Failed to discover participating groups:', error);
+        }
+      } else {
+        console.log(`WhatsApp connected; listening to ${TARGET_GROUP_JID}`);
+      }
+    }
     if (connection === 'close') {
-      const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
       console.log(`Connection dropped. Reconnecting: ${shouldReconnect}`);
-      if (shouldReconnect) startBot();
+      if (shouldReconnect) void startBot();
     }
   });
-
-  sock.ev.on('messages.upsert', async (m) => {
-    const msg = m.messages[0];
-    if (!msg || !msg.message || !msg.key.remoteJid) return;
-
-    if (TARGET_GROUP_JID && msg.key.remoteJid === TARGET_GROUP_JID) {
-      const msgId = msg.key.id;
-      const sender = msg.key.participant || msg.key.remoteJid;
-      const pushName = msg.pushName || 'Unknown';
-      const timestamp = msg.messageTimestamp;
-
-      const unwrappedPayload = unwrapMessage(msg.message);
-      if (!unwrappedPayload) return;
-
-      const msgType = Object.keys(unwrappedPayload)[0];
-      const content = extractContent(unwrappedPayload);
-      let mediaPath = null;
-
-      // Handle file download if message type contains media
-      if (['imageMessage', 'videoMessage', 'documentMessage', 'stickerMessage', 'audioMessage'].includes(msgType)) {
-        const rawDocName = unwrappedPayload[msgType]?.fileName || '';
-        mediaPath = await handleMediaDownload(msg, msgType, rawDocName);
-      }
-
-      // Ignore empty system protocol updates
-      if (!content && !mediaPath) return;
-
+  sock.ev.on('messages.upsert', async ({ messages }) => {
+    for (const msg of messages) {
       try {
-        insertMessage.run(msgId, sender, pushName, content, mediaPath, timestamp);
-        console.log(`Saved message [${msgId}] from ${pushName}: "${content.substring(0, 30)}..." | Storage: ${mediaPath ? mediaPath : 'Text Only'}`);
-      } catch (err) {
-        console.error('Failed to write message to database:', err.message);
+        await archiveMessage(msg);
+      } catch (error) {
+        console.error(`Failed to archive message ${msg?.key?.id || 'unknown'}:`, error);
       }
     }
   });
 }
 
-startBot();
+startBot().catch(async (error) => {
+  console.error('Failed to start archive service:', error);
+  await prisma.$disconnect();
+  process.exitCode = 1;
+});
+
+process.once('SIGINT', async () => {
+  await prisma.$disconnect();
+  process.exit(0);
+});

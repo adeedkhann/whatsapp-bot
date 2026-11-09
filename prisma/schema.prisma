@@ -1,0 +1,63 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum MessageType {
+  TEXT
+  IMAGE
+  VIDEO
+  DOCUMENT
+  AUDIO
+  STICKER
+  REACTION
+}
+
+model User {
+  id        String    @id
+  pushName  String
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  messages  Message[]
+}
+
+model Message {
+  id                 String              @id
+  senderId           String
+  groupJid           String
+  content            String              @db.Text
+  messageType        MessageType
+  rawPayload         Json?
+  timestamp          DateTime
+  sender             User                @relation(fields: [senderId], references: [id])
+  media              Media?
+  llmContextMetadata LLMContextMetadata?
+
+  @@index([groupJid, timestamp])
+  @@index([timestamp])
+  @@index([senderId, timestamp])
+}
+
+model Media {
+  id            String  @id @default(uuid())
+  messageId     String  @unique
+  cloudinaryUrl String
+  publicId      String
+  fileType      String
+  fileName      String?
+  fileSize      Int?
+  message       Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+}
+
+model LLMContextMetadata {
+  id                String                 @id @default(uuid())
+  messageId         String                 @unique
+  extractedSummary  String?                @db.Text
+  isContextEligible Boolean                @default(true)
+  embedding         Unsupported("vector")?
+  message           Message                @relation(fields: [messageId], references: [id], onDelete: Cascade)
+}

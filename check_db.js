@@ -1,15 +1,27 @@
-// check_db.js
-import Database from 'better-sqlite3';
+import 'dotenv/config';
+import { PrismaClient } from '@prisma/client';
 
-const db = new Database('mlcoe_archive.db');
+const prisma = new PrismaClient();
 
-// Database se latest 10 messages fetch karne ke liye query
-const rows = db.prepare(`
-  SELECT id, sender, push_name, content, datetime(timestamp, 'unixepoch', 'localtime') as time 
-  FROM messages 
-  ORDER BY timestamp DESC 
-  LIMIT 10
-`).all();
+try {
+  const messages = await prisma.message.findMany({
+    orderBy: { timestamp: 'desc' },
+    take: 30,
+    include: {
+      sender: true,
+      media: true,
+      llmContextMetadata: true,
+    },
+  });
 
-console.log('\n--- LATEST MLCOE GROUP MESSAGES ---');
-console.table(rows);
+  console.table(messages.map((message) => ({
+    time: message.timestamp.toISOString(),
+    sender: message.sender.pushName,
+    type: message.messageType,
+    content: message.content,
+    media: message.media?.cloudinaryUrl || '',
+    contextEligible: message.llmContextMetadata?.isContextEligible ?? true,
+  })));
+} finally {
+  await prisma.$disconnect();
+}
